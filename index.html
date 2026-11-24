@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Tide Clock</title>
+<style>
+  body { margin:0; font-family:system-ui, sans-serif; background:#0b1d2e; color:#e8f1f8; text-align:center; }
+  h1 { font-size:1.2rem; font-weight:500; margin:16px 0 8px; }
+  #tabs { display:flex; justify-content:center; gap:8px; margin-bottom:10px; }
+  #tabs button { background:#10304a; color:#c8dcea; border:1px solid #2a5b82; border-radius:999px; padding:6px 16px; font-size:0.95rem; cursor:pointer; }
+  #tabs button.active { background:#1f78b4; color:#fff; border-color:#4db3ff; }
+  #status { font-size:2rem; margin:4px 0; }
+  #sub { color:#8fb3cc; }
+  #sun { color:#ffd98f; font-size:0.95rem; margin:2px 0 6px; }
+  #moon { display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:10px; color:#c8dcea; font-size:0.95rem; margin:6px 12px 10px; }
+  #clock { width:340px; max-width:92vw; height:auto; }
+  #curve { width:100%; max-width:760px; height:auto; background:#10304a; border-radius:12px; }
+  #list { margin:12px auto 24px; max-width:420px; text-align:left; }
+  #list div { display:flex; justify-content:space-between; padding:4px 12px; border-bottom:1px solid #1d3a52; }
+  .hi { color:#7fd4ff; }
+  .lo { color:#ffcf7f; }
+</style>
+</head>
+<body>
+<h1 id='title'>Tides</h1>
+<div id='tabs'></div>
+<div id='status'>Loading...</div>
+<div id='sub'></div>
+<div id='sun'></div>
+<div id='moon'></div>
+<svg id='clock' viewBox='-170 -170 340 340'></svg>
+<svg id='curve' viewBox='0 0 760 220'></svg>
+<div id='list'></div>
+
+<script>
+const NS = 'http://www.w3.org/2000/svg';
+
+// To add a station: copy a line, then fill in its NOAA station ID and its latitude and longitude.
+const STATIONS = {
+  sb:  { name:'Santa Barbara',     id:'9411340', lat:34.4033, lon:-119.6883 },
+  sci: { name:'Santa Cruz Island', id:'9410971', lat:34.0200, lon:-119.6830 }
+};
+
+let current = 'sb';
+try { const saved = localStorage.getItem('tideStation'); if (STATIONS[saved]) current = saved; } catch (e) {}
+let events = [];
+
+const $ = id => document.getElementById(id);
+
+function el(parent, tag, attrs, text) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text !== undefined) n.textContent = text;
+  parent.appendChild(n);
+  return n;
+}
+function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
+function fmt(d) { return d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' }); }
+function ymd(d) {
+  return d.getUTCFullYear() + String(d.getUTCMonth() + 1).padStart(2, '0') + String(d.getUTCDate()).padStart(2, '0');
+}
+
+// ---------- tabs ----------
+function buildTabs() {
+  const box = $('tabs');
+  clear(box);
+  Object.keys(STATIONS).forEach(key => {
+    const b = document.createElement('button');
+    b.textContent = STATIONS[key].name;
+    if (key === current) b.className = 'active';
+    b.onclick = () => setStation(key);
+    box.appendChild(b);
+  });
+}
+
+function setStation(key) {
+  current = key;
+  try { localStorage.setItem('tideStation', key); } catch (e) {}
+  events = [];
+  buildTabs();
+  $('title').textContent = STATIONS[key].name + ' Tides';
+  document.title = STATIONS[key].name + ' Tides';
+  $('status').textContent = 'Loading...';
+  $('sub').textContent = '';
+  load();
+}
+
+// ---------- data ----------
+async function load() {
+  const key = current;
+  const st = STATIONS[key];
+  try {
+    const url = 'https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&application=tideclock'
+      + '&begin_date=' + ymd(new Date(Date.now() - 86400000))
+      + '&end_date=' + ymd(new Date(Date.now() + 4 * 86400000))
+      + '&datum=MLLW&station=' + st.id + '&time_zone=gmt&units=english&interval=hilo&format=json';
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    if (!j.predictions) throw new Error(j.error && j.error.message ? j.error.message : 'No data returned');
+    if (key !== current) return; // you switched tabs while this was loading
+    events = j.predictions.map(p => ({
+      t: new Date(p.t.replace(' ', 'T') + ':00Z'),
+      h: parseFloat(p.v),
+      type: p.type === 'H' ? 'High' : 'Low'
+    }));
+    draw();
+  } catch (err) {
+    $('status').textContent = 'Could not load tides';
+    $('sub').textContent = err.message;
+  }
+}
+
+// Cosine interpolation between successive highs and lows approximates the real curve well.
+function heightAt(t) {
+  for (let i = 0; i < events.length - 1; i++) {
+    const a = events[i], b = events[i + 1];
+    if (t >= a.t && t <= b.t) {
+      const f = (t - a.t) / (b.t - a.t);
+      return a.h + (b.h - a.h) * (1 - Math.cos(Math.PI * f)) / 2;
+    }
+  }
+  return null;
+}
+
+// ---------- sun (NOAA solar position formulas) ----------
+function sunTimes(date, lat, lon) {
+  const rad = Math.PI / 180;
+  const y = date.getFullYear(), m = date.getMonth(), d = date.getDate();
+  const jd = Date.UTC(y, m, d, 12) / 86400000 + 2440587.5;
+  const T = (jd - 2451545) / 36525;
+  const L0 = 280.46646 + T * (36000.76983 + T * 0.0003032);
+  const M = 357.52911 + T * (35999.05029 - 0.0001537 * T);
+  const e = 0.016708634 - T * (0.000042037 + 0.0000001267 * T);
+  const C = Math.sin(M * rad) * (1.914602 - T * (0.004817 + 0.000014 * T))
+          + Math.sin(2 * M * rad) * (0.019993 - 0.000101 * T)
+          + Math.sin(3 * M * rad) * 0.000289;
+  const omega = 125.04 - 1934.136 * T;
+  const lambda = L0 + C - 0.00569 - 0.00478 * Math.sin(omega * rad);
+  const eps0 = 23 + (26 + (21.448 - T * (46.815 + T * (0.00059 - T * 0.001813))) / 60) / 60;
+  const eps = eps0 + 0.00256 * Math.cos(omega * rad);
+  const decl = Math.asin(Math.sin(eps * rad) * Math.sin(lambda * rad)) / rad;
+  const v = Math.pow(Math.tan(eps * rad / 2), 2);
+  const eqTime = 4 / rad * (v * Math.sin(2 * L0 * rad) - 2 * e * Math.sin(M * rad)
+    + 4 * e * v * Math.sin(M * rad) * Math.cos(2 * L0 * rad)
+    - 0.5 * v * v * Math.sin(4 * L0 * rad) - 1.25 * e * e * Math.sin(2 * M * rad));
+  const ha = Math.acos(Math.cos(90.833 * rad) / (Math.cos(lat * rad) * Math.cos(decl * rad))
+    - Math.tan(lat * rad) * Math.tan(decl * rad)) / rad;
+  const noon = 720 - 4 * lon - eqTime; // minutes after UTC midnight
+  const base = Date.UTC(y, m, d);
+  return { rise: new Date(base + (noon - 4 * ha) * 60000), set: new Date(base + (noon + 4 * ha) * 60000) };
+}
+
+// ---------- moon ----------
+function moonInfo(date) {
+  const SYN = 29.530588853;
+  const jd = date.getTime() / 86400000 + 2440587.5;
+  const p = ((((jd - 2451550.26) % SYN) + SYN) % SYN) / SYN; // 0 = new, 0.5 = full
+  const lit = (1 - Math.cos(2 * Math.PI * p)) / 2;
+  let name;
+  if (p < 0.03 || p >= 0.97) name = 'New Moon';
+  else if (p < 0.22) name = 'Waxing Crescent';
+  else if (p < 0.28) name = 'First Quarter';
+  else if (p < 0.47) name = 'Waxing Gibbous';
+  else if (p < 0.53) name = 'Full Moon';
+  else if (p < 0.72) name = 'Waning Gibbous';
+  else if (p < 0.78) name = 'Last Quarter';
+  else name = 'Waning Crescent';
+  const nearSyzygy = Math.min(p, Math.abs(p - 0.5), 1 - p); // distance to nearest new or full moon
+  const tideNote = nearSyzygy < 0.1 ? 'spring tides, bigger swings' : (nearSyzygy > 0.17 ? 'neap tides, smaller swings' : '');
+  const r = 14, c = Math.cos(2 * Math.PI * p), rx = (r * Math.abs(c)).toFixed(2);
+  const waxing = p < 0.5;
+  const outer = waxing ? 1 : 0;
+  const inner = waxing ? (c > 0 ? 0 : 1) : (c > 0 ? 1 : 0);
+  const path = 'M0,-' + r + ' A' + r + ',' + r + ' 0 0 ' + outer + ' 0,' + r + ' A' + rx + ',' + r + ' 0 0 ' + inner + ' 0,-' + r + ' Z';
+  return { name: name, lit: lit, tideNote: tideNote, path: path };
+}
+
+function drawMoon(now) {
+  const m = moonInfo(now);
+  const box = $('moon');
+  clear(box);
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('width', '32');
+  svg.setAttribute('height', '32');
+  svg.setAttribute('viewBox', '-16 -16 32 32');
+  el(svg, 'circle', { r:14, fill:'#1b3550', stroke:'#3b6a8f' });
+  el(svg, 'path', { d:m.path, fill:'#f4efd0' });
+  box.appendChild(svg);
+  const t = document.createElement('span');
+  t.textContent = m.name + ', ' + Math.round(m.lit * 100) + '% lit' + (m.tideNote ? ' - ' + m.tideNote : '');
+  box.appendChild(t);
+}
+
+// ---------- drawing ----------
+function draw() {
+  if (events.length < 2) return;
+  const now = new Date();
+  const h = heightAt(now);
+  const next = events.find(e => e.t > now);
+  if (h === null || !next) return;
+  const st = STATIONS[current];
+  const rising = next.type === 'High';
+  $('status').textContent = (rising ? 'Rising' : 'Falling') + ' - ' + h.toFixed(1) + ' ft';
+  $('sub').textContent = 'Next ' + next.type.toLowerCase() + ' at ' + fmt(next.t) + ' (' + next.h.toFixed(1) + ' ft)';
+  const sun = sunTimes(new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12), st.lat, st.lon);
+  $('sun').textContent = 'Sunrise ' + fmt(sun.rise) + '  |  Sunset ' + fmt(sun.set);
+  drawMoon(now);
+  drawClock(now);
+  drawCurve(now, st, h);
+  drawList(now);
+}
+
+function drawClock(now) {
+  const svg = $('clock');
+  clear(svg);
+  el(svg, 'circle', { r:150, fill:'#10304a', stroke:'#2a5b82', 'stroke-width':3 });
+  const clip = el(svg, 'clipPath', { id:'dial' });
+  el(clip, 'circle', { r:148 });
+  // Water level: fills from the bottom up to the current height
+  const vals = events.map(e => e.h);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const frac = (heightAt(now) - lo) / (hi - lo);
+  const y = 150 - frac * 300;
+  el(svg, 'rect', { x:-150, y:y, width:300, height:150 - y, fill:'#1f78b4', opacity:0.55, 'clip-path':'url(#dial)' });
+  // Hour ticks
+  for (let i = 0; i < 12; i++) {
+    const a = i * Math.PI / 6;
+    el(svg, 'line', { x1:Math.sin(a) * 135, y1:-Math.cos(a) * 135, x2:Math.sin(a) * 148, y2:-Math.cos(a) * 148, stroke:'#8fb3cc', 'stroke-width':2 });
+  }
+  // Tides within 6 hours, placed on the dial at their clock time
+  events.filter(e => Math.abs(e.t - now) < 6 * 3600000).forEach(e => {
+    const hrs = (e.t.getHours() % 12) + e.t.getMinutes() / 60, a = hrs * Math.PI / 6;
+    const x = Math.sin(a) * 118, yy = -Math.cos(a) * 118;
+    el(svg, 'circle', { cx:x, cy:yy, r:9, fill:(e.type === 'High' ? '#7fd4ff' : '#ffcf7f') });
+    el(svg, 'text', { x:x, y:yy + 4, 'font-size':10, 'text-anchor':'middle', fill:'#0b1d2e', 'font-weight':700 }, e.type === 'High' ? 'H' : 'L');
+  });
+  // Hand for the current time
+  const hn = (now.getHours() % 12) + now.getMinutes() / 60, an = hn * Math.PI / 6;
+  el(svg, 'line', { x1:0, y1:0, x2:Math.sin(an) * 100, y2:-Math.cos(an) * 100, stroke:'#fff', 'stroke-width':4, 'stroke-linecap':'round' });
+  el(svg, 'circle', { r:6, fill:'#fff' });
+}
+
+function drawCurve(now, st, hNow) {
+  const svg = $('curve');
+  clear(svg);
+  const t0 = now.getTime() - 6 * 3600000, t1 = now.getTime() + 42 * 3600000;
+  const vals = events.map(e => e.h);
+  const lo = Math.min(...vals) - 0.5, hi = Math.max(...vals) + 0.5;
+  const X = t => (t - t0) / (t1 - t0) * 760;
+  const Y = v => 200 - (v - lo) / (hi - lo) * 150;
+
+  // Night shading from each sunset to the next sunrise
+  const day0 = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12);
+  const rises = [], sets = [];
+  for (let k = -1; k <= 3; k++) {
+    const s = sunTimes(new Date(day0.getTime() + k * 86400000), st.lat, st.lon);
+    rises.push(s.rise);
+    sets.push(s.set);
+  }
+  for (let i = 0; i < sets.length - 1; i++) {
+    const a = Math.max(sets[i].getTime(), t0), b = Math.min(rises[i + 1].getTime(), t1);
+    if (b > a) el(svg, 'rect', { x:X(a), y:0, width:X(b) - X(a), height:220, fill:'#040b13', opacity:0.55 });
+  }
+  const marks = [];
+  rises.forEach(d => marks.push({ t:d, label:'Sunrise' }));
+  sets.forEach(d => marks.push({ t:d, label:'Sunset' }));
+  marks.filter(m => m.t.getTime() > t0 && m.t.getTime() < t1).forEach(m => {
+    const x = X(m.t.getTime());
+    el(svg, 'line', { x1:x, y1:22, x2:x, y2:220, stroke:'#ffd98f', 'stroke-width':1, 'stroke-dasharray':'2 4', opacity:0.7 });
+    el(svg, 'text', { x:Math.min(Math.max(x, 50), 710), y:14, 'font-size':11, 'text-anchor':'middle', fill:'#ffd98f' }, m.label + ' ' + fmt(m.t));
+  });
+
+  // Tide curve
+  let pts = '';
+  for (let t = t0; t <= t1; t += 15 * 60000) {
+    const v = heightAt(new Date(t));
+    if (v !== null) pts += X(t).toFixed(1) + ',' + Y(v).toFixed(1) + ' ';
+  }
+  el(svg, 'polyline', { points:pts, fill:'none', stroke:'#4db3ff', 'stroke-width':3 });
+
+  // Now marker
+  el(svg, 'line', { x1:X(now.getTime()), y1:0, x2:X(now.getTime()), y2:220, stroke:'#fff', 'stroke-dasharray':'4 4' });
+  el(svg, 'circle', { cx:X(now.getTime()), cy:Y(hNow), r:5, fill:'#fff' });
+
+  // Labels for each high and low
+  events.filter(e => e.t.getTime() > t0 && e.t.getTime() < t1).forEach(e => {
+    el(svg, 'text', { x:X(e.t.getTime()), y:Y(e.h) + (e.type === 'High' ? -6 : 16), 'font-size':12, 'text-anchor':'middle', fill:'#c8dcea' }, fmt(e.t));
+  });
+}
+
+function drawList(now) {
+  const box = $('list');
+  clear(box);
+  events.filter(e => e.t > now).slice(0, 6).forEach(e => {
+    const row = document.createElement('div');
+    row.className = e.type === 'High' ? 'hi' : 'lo';
+    const a = document.createElement('span');
+    a.textContent = e.type + ' - ' + e.t.toLocaleDateString([], { weekday:'short' }) + ' ' + fmt(e.t);
+    const b = document.createElement('span');
+    b.textContent = e.h.toFixed(1) + ' ft';
+    row.appendChild(a);
+    row.appendChild(b);
+    box.appendChild(row);
+  });
+}
+
+setStation(current);
+setInterval(draw, 60000);       // redraw every minute
+setInterval(load, 6 * 3600000); // refetch predictions every 6 hours
+</script>
+</body>
+</html>
