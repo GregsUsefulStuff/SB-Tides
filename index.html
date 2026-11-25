@@ -212,18 +212,48 @@ function draw() {
   drawList(now);
 }
 
+// A wavy water surface: a sine wave on top of a block of water that reaches well below the dial.
+function wavePath(amp, period) {
+  let d = 'M-250,0';
+  for (let x = -250; x <= 450; x += 5) {
+    d += ' L' + x + ',' + (amp * Math.sin((x + 250) / period * 2 * Math.PI)).toFixed(1);
+  }
+  return d + ' L450,320 L-250,320 Z';
+}
+
+// Built once. The dial and water stay in place between redraws so the wave never restarts.
+function setupClock(svg) {
+  el(svg, 'circle', { r:150, fill:'#10304a', stroke:'#2a5b82', 'stroke-width':3, class:'keep' });
+  const clip = el(svg, 'clipPath', { id:'dial', class:'keep' });
+  el(clip, 'circle', { r:148 });
+  const frame = el(svg, 'g', { 'clip-path':'url(#dial)', class:'keep' });
+  const water = el(frame, 'g', { id:'water' });
+  const calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // Two wave layers drifting in opposite directions. Each slides exactly one wave length, so the loop is seamless.
+  [
+    { amp:4, period:150, from:0,    to:-150, dur:'9s', fill:'#1f78b4', opacity:0.45 },
+    { amp:5, period:100, from:-100, to:0,    dur:'6s', fill:'#2b8fd0', opacity:0.55, stroke:'#9fdcff' }
+  ].forEach(w => {
+    const layer = el(water, 'g', {});
+    const attrs = { d:wavePath(w.amp, w.period), fill:w.fill, opacity:w.opacity };
+    if (w.stroke) { attrs.stroke = w.stroke; attrs['stroke-width'] = 1.5; }
+    el(layer, 'path', attrs);
+    if (!calm) {
+      el(layer, 'animateTransform', { attributeName:'transform', type:'translate', from:w.from + ' 0', to:w.to + ' 0', dur:w.dur, repeatCount:'indefinite' });
+    }
+  });
+}
+
 function drawClock(now) {
   const svg = $('clock');
-  clear(svg);
-  el(svg, 'circle', { r:150, fill:'#10304a', stroke:'#2a5b82', 'stroke-width':3 });
-  const clip = el(svg, 'clipPath', { id:'dial' });
-  el(clip, 'circle', { r:148 });
-  // Water level: fills from the bottom up to the current height
+  if (!$('water')) { clear(svg); setupClock(svg); }
+  // Redraw everything except the dial and the water
+  Array.from(svg.children).filter(n => n.getAttribute('class') !== 'keep').forEach(n => svg.removeChild(n));
+  // Water level: the surface sits at the current height between the day's low and high
   const vals = events.map(e => e.h);
   const lo = Math.min(...vals), hi = Math.max(...vals);
   const frac = (heightAt(now) - lo) / (hi - lo);
-  const y = 150 - frac * 300;
-  el(svg, 'rect', { x:-150, y:y, width:300, height:150 - y, fill:'#1f78b4', opacity:0.55, 'clip-path':'url(#dial)' });
+  $('water').setAttribute('transform', 'translate(0,' + (150 - frac * 300).toFixed(1) + ')');
   // Hour ticks
   for (let i = 0; i < 12; i++) {
     const a = i * Math.PI / 6;
